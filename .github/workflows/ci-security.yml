@@ -1,0 +1,244 @@
+# Reusable DevSecOps pipeline — called by every app repo with ~20 lines.
+#
+# PR:   build/test → CodeQL → dependency review → AI-provenance gate
+# main: container build → Trivy → SBOM (Syft) → Cosign sign → push ECR
+#       → PR a digest bump to platform-config (staging) → Argo CD syncs.
+#
+# CI holds no cluster credentials; its only AWS permission is ECR push via OIDC.
+
+name: ci-security
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "ECR repo suffix, e.g. podinfo"
+        required: true
+        type: string
+      codeql-language:
+        description: "CodeQL language: javascript-typescript | go | python | java-kotlin"
+        required: true
+        type: string
+      dockerfile:
+        default: Dockerfile
+        type: string
+      build-context:
+        default: "."
+        type: string
+      test-command:
+        description: "Optional shell command for unit tests"
+        default: ""
+        type: string
+      fail-on-severity:
+        description: "dependency-review threshold"
+        default: high
+        type: string
+
+permissions: {} # each job requests exactly what it needs
+
+env:
+  AWS_REGION: ap-southeast-1
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.codeql-language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ inputs.codeql-language }}"
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          license-check: true
+          deny-licenses: AGPL-3.0-only, AGPL-3.0-or-later
+          comment-summary-in-pr: on-failure
+
+  # Agentic-AI / vibe-coding controls:
+  # 1. detect AI-attributed commits (Co-Authored-By trailers of known agents)
+  # 2. label the PR ai-assisted
+  # 3. fail unless at least one HUMAN (non-author, non-bot) approval exists
+  ai-provenance:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request.number;
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr });
+            const aiPattern = /co-authored-by:.*\b(claude|copilot|chatgpt|openai|gemini|cursor|devin|codex|windsurf|aider)\b/i;
+            const aiCommits = commits.filter(c => aiPattern.test(c.commit.message));
+
+            if (aiCommits.length === 0) {
+              core.info('No AI-attributed commits detected.');
+              return;
+            }
+
+            core.notice(`${aiCommits.length}/${commits.length} commits are AI-attributed.`);
+            await github.rest.issues.addLabels({ owner, repo, issue_number: pr, labels: ['ai-assisted'] });
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr });
+            const author = context.payload.pull_request.user.login;
+            const humanApprovals = reviews.filter(r =>
+              r.state === 'APPROVED' &&
+              r.user.login !== author &&
+              r.user.type !== 'Bot'
+            );
+
+            if (humanApprovals.length === 0) {
+              core.setFailed(
+                'AI-provenance gate: this PR contains AI-attributed commits but no human review yet. ' +
+                'A human (non-author) approval is required before merge.'
+              );
+            } else {
+              core.info(`Human review present: ${humanApprovals.map(r => r.user.login).join(', ')}`);
+            }
+
+  build-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-test, codeql]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # OIDC federation to AWS + keyless Cosign
+      security-events: write # Trivy SARIF upload
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        id: build
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/devsecops-demo/${{ inputs.image-name }}:${{ github.sha }}
+        run: |
+          docker build -f "${{ inputs.dockerfile }}" -t "$IMAGE" "${{ inputs.build-context }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy scan (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-container
+
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.build.outputs.image }}
+          format: spdx-json
+          artifact-name: sbom-${{ inputs.image-name }}.spdx.json
+
+      - name: Push
+        id: push
+        run: |
+          docker push "${{ steps.build.outputs.image }}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.build.outputs.image }}" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Cosign sign (keyless, OIDC)
+        uses: sigstore/cosign-installer@v3
+      - run: cosign sign --yes "${{ steps.ecr.outputs.registry }}/devsecops-demo/${{ inputs.image-name }}@${{ steps.push.outputs.digest }}"
+
+  # Promotion = a PR to platform-config. Argo CD pulls; CI never touches the cluster.
+  promote-staging:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Open digest-bump PR on platform-config
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = 'platform-config';
+            const app = '${{ inputs.image-name }}';
+            const digest = '${{ needs.build-push.outputs.digest }}';
+            const path = `apps/${app}/overlays/staging/image-digest.yaml`;
+            const branch = `bump/${app}-${digest.slice(7, 19)}`;
+
+            const { data: base } = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+            await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: base.commit.sha });
+
+            let sha;
+            try {
+              const { data: existing } = await github.rest.repos.getContent({ owner, repo, path, ref: branch });
+              sha = existing.sha;
+            } catch (e) { /* new file */ }
+
+            const registry = '${{ vars.ECR_REGISTRY }}';
+            const content = [
+              'apiVersion: builtin',
+              'kind: ImageTagTransformer',
+              'metadata:',
+              '  name: image-digest',
+              'imageTag:',
+              `  name: ${registry}/devsecops-demo/${app}`,
+              `  digest: ${digest}`,
+              ''
+            ].join('\n');
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path, branch, sha,
+              message: `chore(${app}): staging → ${digest.slice(0, 19)}`,
+              content: Buffer.from(content).toString('base64')
+            });
+
+            await github.rest.pulls.create({
+              owner, repo,
+              title: `Deploy ${app} ${digest.slice(0, 19)} to staging`,
+              head: branch, base: 'main',
+              body: `Automated digest bump from ${context.repo.repo}@${context.sha}.\n\nSigned image: \`${digest}\`\nMerging deploys to **staging** via Argo CD.`
+            });
