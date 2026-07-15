@@ -135,6 +135,7 @@ jobs:
       contents: read
       id-token: write        # OIDC federation to AWS + keyless Cosign
       security-events: write # Trivy SARIF upload
+      actions: read          # required on private repos
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -156,6 +157,15 @@ jobs:
         run: |
           docker build -f "${{ inputs.dockerfile }}" -t "$IMAGE" "${{ inputs.build-context }}"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy report (log, non-gating)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
 
       - name: Trivy scan (gate)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
