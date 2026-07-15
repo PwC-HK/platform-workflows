@@ -62,7 +62,12 @@ jobs:
         with:
           languages: ${{ inputs.codeql-language }}
           queries: security-extended
-          build-mode: none # Go autobuild hangs on Makefile-driven repos; not needed for analysis
+          # Go requires a build; 'manual' + explicit go build avoids autobuild hangs
+          # on Makefile-driven repos. Interpreted languages need no build at all.
+          build-mode: ${{ inputs.codeql-language == 'go' && 'manual' || 'none' }}
+      - name: Build (Go, manual mode)
+        if: inputs.codeql-language == 'go'
+        run: go build ./...
       - uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ inputs.codeql-language }}"
