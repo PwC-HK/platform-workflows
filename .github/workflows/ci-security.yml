@@ -176,6 +176,7 @@ jobs:
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          limit-severities-for-sarif: "true" # without this, sarif mode fails on ALL severities
 
       - name: Upload Trivy results
         if: always()
