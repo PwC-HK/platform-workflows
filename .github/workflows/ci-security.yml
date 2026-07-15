@@ -62,6 +62,7 @@ jobs:
         with:
           languages: ${{ inputs.codeql-language }}
           queries: security-extended
+          build-mode: none # Go autobuild hangs on Makefile-driven repos; not needed for analysis
       - uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ inputs.codeql-language }}"
